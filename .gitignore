@@ -14,3 +14,4 @@ yarn-error.log*
 *.swo
 *.bak
 *.tmp
+./data/analyses/*
