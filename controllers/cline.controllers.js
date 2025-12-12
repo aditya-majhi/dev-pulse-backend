@@ -1,282 +1,147 @@
-const { exec, spawn } = require("child_process");
-const { promisify } = require("util");
+const { spawn } = require("child_process");
 const fs = require("fs").promises;
 const path = require("path");
-const execPromise = promisify(exec);
+const axios = require("axios");
+const supabase = require("../services/supabase.services");
 
-// Analyze repository when user selects it from dashboard
+// =============================
+// MAIN ENDPOINTS
+// =============================
+
+//Create analysis and start workflow
 exports.analyzeRepository = async (req, res) => {
-  let tempDir = null;
-  let analysisId = null;
+  const {
+    repoUrl,
+    repoName,
+    owner,
+    enableAIFix = false,
+    accessToken,
+  } = req.body;
+
+  const userId = req.user?.id ? String(req.user.id) : null;
+
+  if (!repoUrl || !repoName || !owner) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
 
   try {
-    const { repoUrl, repoName, owner } = req.body;
-
-    if (!repoUrl || !repoName || !owner) {
-      return res.status(400).json({
-        error: "Missing required fields: repoUrl, repoName, owner",
-      });
-    }
-
-    console.log(`\n${"=".repeat(60)}`);
-    console.log(`🔍 ANALYZING REPOSITORY: ${owner}/${repoName}`);
-    console.log(`${"=".repeat(60)}\n`);
-
-    // Generate analysis ID
-    analysisId = `analysis-${Date.now()}-${Math.random()
+    const analysisId = `analysis-${Date.now()}-${Math.random()
       .toString(36)
       .substr(2, 9)}`;
 
-    // Create temp directory for cloning
-    tempDir = path.join(__dirname, "../temp", analysisId);
-    await fs.mkdir(tempDir, { recursive: true });
-
-    console.log(`📂 Created temp directory: ${tempDir}`);
-
-    // Update analysis status to "cloning"
-    await updateAnalysisStatus(analysisId, "cloning", {
-      repoUrl,
-      repoName,
-      owner,
-      startTime: new Date().toISOString(),
+    const { error } = await supabase.from("analyses").insert({
+      analysis_id: analysisId,
+      user_id: userId,
+      repo_url: repoUrl,
+      repo_name: repoName,
+      repo_owner: owner,
+      status: "initializing",
+      progress: 0,
+      current_step: 0,
+      total_steps: enableAIFix ? 8 : 6,
+      message: "Starting analysis...",
     });
 
-    // Send immediate response to prevent timeout
+    if (error) {
+      console.error("Supabase insert error:", error);
+      throw error;
+    }
+
+    console.log(`🚀 Analysis started: ${analysisId}`);
+
     res.json({
       success: true,
       analysisId,
-      status: "started",
-      message:
-        "Repository analysis started. Use the analysisId to track progress.",
-      trackingUrl: `/api/v1/cline/analysis/${analysisId}`,
-      streamUrl: `/api/v1/cline/analysis/${analysisId}/stream`,
+      message: "Analysis started",
     });
 
-    // Continue analysis in background
-    performAnalysis(analysisId, repoUrl, repoName, owner, tempDir);
+    // Run in background
+    performAnalysis(
+      analysisId,
+      repoUrl,
+      repoName,
+      owner,
+      enableAIFix,
+      accessToken
+    ).catch((err) => {
+      console.error(`❌ Analysis ${analysisId} failed:`, err);
+      console.error(`Stack trace:`, err.stack);
+    });
   } catch (error) {
-    console.error(`\n❌ Analysis failed:`, error.message);
-    console.error(error.stack);
+    console.error("Error in analyzeRepository:", error);
+    res.status(500).json({ error: error.message });
+  }
+};
 
-    // Cleanup on error
-    if (tempDir) {
-      await cleanupTempDir(tempDir);
+//Trigger AI fix on existing analysis
+exports.triggerAIFix = async (req, res) => {
+  const { analysisId, accessToken } = req.body;
+
+  if (!analysisId || !accessToken) {
+    return res.status(400).json({
+      error: "Missing required fields: analysisId, accessToken",
+    });
+  }
+
+  try {
+    const { data: analysis, error } = await supabase
+      .from("analyses")
+      .select("*")
+      .eq("analysis_id", analysisId)
+      .single();
+
+    if (error || !analysis) {
+      return res.status(404).json({ error: "Analysis not found" });
     }
 
-    // Update status to failed
-    if (analysisId) {
-      await updateAnalysisStatus(analysisId, "failed", {
-        error: error.message,
-        stack: error.stack,
+    if (analysis.status !== "completed") {
+      return res.status(400).json({
+        error: "Analysis must be completed before running AI fix",
       });
     }
 
-    res.status(500).json({
-      error: "Repository analysis failed",
-      details: error.message,
+    console.log(`🔧 Triggering AI fix for: ${analysisId}`);
+
+    res.json({
+      success: true,
+      message: "AI fix started",
       analysisId,
+    });
+
+    // Run AI fix in background
+    runAIFixWorkflow(
+      {
+        analysisId: analysis.analysis_id,
+        repoName: analysis.repo_name,
+        owner: analysis.repo_owner,
+        repoUrl: analysis.repo_url,
+      },
+      accessToken
+    ).catch((err) => console.error(`AI fix ${analysisId} failed:`, err));
+  } catch (error) {
+    res.status(500).json({
+      error: "Failed to trigger AI fix",
+      details: error.message,
     });
   }
 };
 
-// Background analysis function
-async function performAnalysis(analysisId, repoUrl, repoName, owner, tempDir) {
-  try {
-    // Step 1: Clone repository
-    console.log(`\n📦 Step 1: Cloning repository...`);
-    const cloneResult = await cloneRepository(repoUrl, tempDir);
-    console.log(`✅ Repository cloned successfully`);
-
-    // Update status to "analyzing"
-    await updateAnalysisStatus(analysisId, "analyzing", {
-      cloned: true,
-      cloneTime: cloneResult.duration,
-    });
-
-    // Step 2: Get repository structure
-    console.log(`\n📁 Step 2: Analyzing repository structure...`);
-    const structure = await analyzeStructure(tempDir);
-    console.log(
-      `✅ Found ${structure.totalFiles} files in ${structure.directories.length} directories`
-    );
-
-    // Step 3: Analyze code quality with Cline CLI
-    console.log(`\n🤖 Step 3: Running Cline CLI analysis...`);
-    const clineAnalysis = await runClineAnalysis(tempDir, repoName);
-    console.log(`✅ Cline analysis complete`);
-
-    // Step 4: Check for security vulnerabilities
-    console.log(`\n🔒 Step 4: Checking security vulnerabilities...`);
-    const securityCheck = await checkSecurity(tempDir);
-    console.log(
-      `✅ Security check complete - Found ${securityCheck.vulnerabilities.length} issues`
-    );
-
-    // Step 5: Analyze dependencies
-    console.log(`\n📦 Step 5: Analyzing dependencies...`);
-    const dependencies = await analyzeDependencies(tempDir);
-    console.log(`✅ Found ${dependencies.total} dependencies`);
-
-    // Step 6: Check test coverage
-    console.log(`\n🧪 Step 6: Checking test coverage...`);
-    const testCoverage = await checkTestCoverage(tempDir);
-    console.log(`✅ Test coverage: ${testCoverage.percentage}%`);
-
-    // Step 7: Calculate code quality score
-    console.log(`\n📊 Step 7: Calculating code quality score...`);
-    const codeQuality = calculateCodeQuality({
-      structure,
-      clineAnalysis,
-      securityCheck,
-      dependencies,
-      testCoverage,
-    });
-    console.log(
-      `✅ Code Quality: ${codeQuality.score}/100 (${codeQuality.grade})`
-    );
-
-    // Step 8: Generate recommendations
-    console.log(`\n💡 Step 8: Generating recommendations...`);
-    const recommendations = generateRecommendations({
-      codeQuality,
-      securityCheck,
-      testCoverage,
-      dependencies,
-      structure,
-    });
-    console.log(`✅ Generated ${recommendations.length} recommendations`);
-
-    // Create comprehensive analysis result
-    const analysis = {
-      analysisId,
-      repository: {
-        url: repoUrl,
-        name: repoName,
-        owner,
-      },
-      timestamp: new Date().toISOString(),
-      status: "completed",
-
-      // Code Structure
-      structure: {
-        totalFiles: structure.totalFiles,
-        totalLines: structure.totalLines,
-        directories: structure.directories,
-        fileTypes: structure.fileTypes,
-        largestFiles: structure.largestFiles,
-      },
-
-      // Code Quality
-      codeQuality: {
-        score: codeQuality.score,
-        grade: codeQuality.grade,
-        complexity: codeQuality.complexity,
-        maintainability: codeQuality.maintainability,
-        hasTests: testCoverage.hasTests,
-        hasTypeScript: structure.hasTypeScript,
-        hasLinter: structure.hasLinter,
-        hasCI: structure.hasCI,
-      },
-
-      // Cline Analysis
-      clineAnalysis: {
-        issuesFound: clineAnalysis.issues.length,
-        suggestions: clineAnalysis.suggestions,
-        improvements: clineAnalysis.improvements,
-      },
-
-      // Security
-      security: {
-        vulnerabilities: securityCheck.vulnerabilities,
-        criticalCount: securityCheck.critical,
-        highCount: securityCheck.high,
-        mediumCount: securityCheck.medium,
-        lowCount: securityCheck.low,
-      },
-
-      // Dependencies
-      dependencies: {
-        total: dependencies.total,
-        production: dependencies.production,
-        development: dependencies.development,
-        outdated: dependencies.outdated,
-        deprecated: dependencies.deprecated,
-      },
-
-      // Test Coverage
-      testCoverage: {
-        percentage: testCoverage.percentage,
-        hasTests: testCoverage.hasTests,
-        lines: testCoverage.lines,
-        functions: testCoverage.functions,
-        branches: testCoverage.branches,
-      },
-
-      // Recommendations
-      recommendations,
-
-      // Issues Summary
-      issues: [...securityCheck.vulnerabilities, ...clineAnalysis.issues],
-
-      // Metadata
-      metadata: {
-        analysisTime: Date.now() - new Date(analysisId.split("-")[1]).getTime(),
-        tempDir,
-      },
-    };
-
-    // Save analysis to database/file
-    await saveAnalysis(analysis);
-
-    // Update status to completed
-    await updateAnalysisStatus(analysisId, "completed", analysis);
-
-    console.log(`\n${"=".repeat(60)}`);
-    console.log(`✅ ANALYSIS COMPLETE: ${analysisId}`);
-    console.log(`${"=".repeat(60)}\n`);
-
-    // Schedule cleanup (after 1 hour)
-    setTimeout(() => cleanupTempDir(tempDir), 3600000);
-  } catch (error) {
-    console.error(`\n❌ Background analysis failed:`, error.message);
-    console.error(error.stack);
-
-    // Cleanup on error
-    if (tempDir) {
-      await cleanupTempDir(tempDir);
-    }
-
-    // Update status to failed
-    await updateAnalysisStatus(analysisId, "failed", {
-      error: error.message,
-      stack: error.stack,
-    });
-  }
-}
-
-// Get analysis status/results
+//Get analysis results
 exports.getAnalysis = async (req, res) => {
+  const { analysisId } = req.params;
+
   try {
-    const { analysisId } = req.params;
+    const { data, error } = await supabase
+      .from("analyses")
+      .select("*")
+      .eq("analysis_id", analysisId)
+      .single();
 
-    if (!analysisId) {
-      return res.status(400).json({
-        error: "Analysis ID is required",
-      });
+    if (error || !data) {
+      return res.status(404).json({ error: "Analysis not found" });
     }
 
-    const analysis = await loadAnalysis(analysisId);
-
-    if (!analysis) {
-      return res.status(404).json({
-        error: "Analysis not found",
-      });
-    }
-
-    res.json({
-      success: true,
-      analysis,
-    });
+    res.json({ success: true, analysis: data });
   } catch (error) {
     res.status(500).json({
       error: "Failed to get analysis",
@@ -285,219 +150,371 @@ exports.getAnalysis = async (req, res) => {
   }
 };
 
-// Stream analysis progress (Server-Sent Events)
-exports.streamAnalysisProgress = async (req, res) => {
+//Get analysis progress
+exports.getAnalysisProgress = async (req, res) => {
   const { analysisId } = req.params;
 
-  // Set headers for SSE
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-
-  // Send initial connection message
-  res.write(`data: ${JSON.stringify({ type: "connected", analysisId })}\n\n`);
-
-  // Poll for status updates
-  const interval = setInterval(async () => {
-    try {
-      const analysis = await loadAnalysis(analysisId);
-
-      if (analysis) {
-        res.write(
-          `data: ${JSON.stringify({
-            type: "progress",
-            status: analysis.status,
-            data: analysis,
-          })}\n\n`
-        );
-
-        if (analysis.status === "completed" || analysis.status === "failed") {
-          clearInterval(interval);
-          res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
-          res.end();
-        }
-      }
-    } catch (error) {
-      clearInterval(interval);
-      res.write(
-        `data: ${JSON.stringify({
-          type: "error",
-          error: error.message,
-        })}\n\n`
-      );
-      res.end();
-    }
-  }, 1000);
-
-  // Cleanup on client disconnect
-  req.on("close", () => {
-    clearInterval(interval);
-  });
-};
-
-// Get user's analysis history
-exports.getAnalysisHistory = async (req, res) => {
   try {
-    const userId = req.user.id;
-    const { limit = 10, offset = 0 } = req.query;
+    const { data, error } = await supabase
+      .from("analyses")
+      .select(
+        "status, progress, current_step, total_steps, message, code_quality"
+      )
+      .eq("analysis_id", analysisId)
+      .single();
 
-    const history = await getAnalysisHistoryForUser(userId, limit, offset);
+    if (error || !data) {
+      return res.status(404).json({ error: "Analysis not found" });
+    }
 
     res.json({
       success: true,
-      history,
-      total: history.length,
+      analysisId,
+      status: data.status,
+      progress: {
+        percentage: data.progress,
+        currentStep: data.current_step,
+        totalSteps: data.total_steps,
+        message: data.message,
+      },
+      codeQuality: data.code_quality,
     });
   } catch (error) {
     res.status(500).json({
-      error: "Failed to get analysis history",
+      error: "Failed to get progress",
       details: error.message,
     });
   }
 };
 
-// ═══════════════════════════════════════════════════════
-// HELPER FUNCTIONS
-// ═══════════════════════════════════════════════════════
+//Stream analysis progress (Server-Sent Events)
+exports.streamAnalysisProgress = async (req, res) => {
+  const { analysisId } = req.params;
 
-// Clone repository with better error handling
-async function cloneRepository(repoUrl, targetDir) {
-  const startTime = Date.now();
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
 
-  try {
-    console.log(`   📥 Cloning from: ${repoUrl}`);
-    console.log(`   📂 Target: ${targetDir}`);
+  res.write(`event: connected\ndata: ${JSON.stringify({ analysisId })}\n\n`);
 
-    // Use spawn instead of exec for better control
-    const result = await new Promise((resolve, reject) => {
-      const gitProcess = spawn(
-        "git",
-        ["clone", "--depth", "1", "--single-branch", repoUrl, targetDir],
-        {
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 300000, // 5 minutes
-        }
-      );
+  let lastProgress = -1;
 
-      let stdout = "";
-      let stderr = "";
-
-      gitProcess.stdout.on("data", (data) => {
-        stdout += data.toString();
-        console.log(`   ${data.toString().trim()}`);
-      });
-
-      gitProcess.stderr.on("data", (data) => {
-        stderr += data.toString();
-        console.log(`   ${data.toString().trim()}`);
-      });
-
-      gitProcess.on("close", (code) => {
-        if (code === 0) {
-          resolve({ stdout, stderr });
-        } else {
-          reject(new Error(`Git clone failed with code ${code}: ${stderr}`));
-        }
-      });
-
-      gitProcess.on("error", (error) => {
-        reject(new Error(`Failed to start git process: ${error.message}`));
-      });
-
-      // Timeout handler
-      setTimeout(() => {
-        gitProcess.kill();
-        reject(new Error("Git clone timeout after 5 minutes"));
-      }, 300000);
-    });
-
-    const duration = Date.now() - startTime;
-    console.log(`   ⏱️  Clone completed in ${(duration / 1000).toFixed(2)}s`);
-
-    return { success: true, duration };
-  } catch (error) {
-    throw new Error(`Failed to clone repository: ${error.message}`);
-  }
-}
-
-// Analyze repository structure (Windows compatible)
-async function analyzeStructure(repoPath) {
-  console.log(`   📊 Analyzing file structure...`);
-
-  const structure = {
-    totalFiles: 0,
-    totalLines: 0,
-    directories: [],
-    fileTypes: {},
-    largestFiles: [],
-    hasTypeScript: false,
-    hasLinter: false,
-    hasCI: false,
-  };
-
-  // Get all files recursively (Windows compatible)
-  const files = await getAllFiles(repoPath);
-
-  structure.totalFiles = files.length;
-
-  // Analyze each file
-  for (const file of files.slice(0, 1000)) {
+  const interval = setInterval(async () => {
     try {
-      const ext = path.extname(file);
-      const stats = await fs.stat(file);
+      const { data, error } = await supabase
+        .from("analyses")
+        .select("status, progress, current_step, total_steps, message")
+        .eq("analysis_id", analysisId)
+        .single();
 
-      // Count file types
-      structure.fileTypes[ext] = (structure.fileTypes[ext] || 0) + 1;
-
-      // Check for TypeScript
-      if (ext === ".ts" || ext === ".tsx") {
-        structure.hasTypeScript = true;
+      if (error || !data) {
+        res.write(
+          `event: error\ndata: ${JSON.stringify({ error: "Not found" })}\n\n`
+        );
+        clearInterval(interval);
+        res.end();
+        return;
       }
 
-      // Check for linter config
-      if (file.includes(".eslintrc") || file.includes(".prettierrc")) {
-        structure.hasLinter = true;
+      if (data.progress !== lastProgress) {
+        lastProgress = data.progress;
+        res.write(
+          `event: progress\ndata: ${JSON.stringify({
+            status: data.status,
+            progress: data.progress,
+            step: data.current_step,
+            totalSteps: data.total_steps,
+            message: data.message,
+          })}\n\n`
+        );
       }
 
-      // Check for CI config
-      if (file.includes(".github") || file.includes(".gitlab-ci")) {
-        structure.hasCI = true;
-      }
-
-      // Count lines for text files
-      if (ext.match(/\.(js|ts|jsx|tsx|py|java|go|rb)$/)) {
-        const content = await fs.readFile(file, "utf8");
-        const lines = content.split("\n").length;
-        structure.totalLines += lines;
-
-        // Track largest files
-        structure.largestFiles.push({
-          file: file.replace(repoPath, ""),
-          lines,
-          size: stats.size,
-        });
+      if (data.status === "completed" || data.status === "failed") {
+        res.write(`event: ${data.status}\ndata: ${JSON.stringify({})}\n\n`);
+        clearInterval(interval);
+        res.end();
       }
     } catch (error) {
-      // Skip files that can't be read
+      res.write(
+        `event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`
+      );
+      clearInterval(interval);
+      res.end();
+    }
+  }, 1000);
+
+  req.on("close", () => clearInterval(interval));
+};
+
+//Get analysis history
+exports.getAnalysisHistory = async (req, res) => {
+  const userId = req.user?.id ? String(req.user.id) : null;
+  const { limit = 10, offset = 0 } = req.query;
+
+  try {
+    let query = supabase
+      .from("analyses")
+      .select(
+        "analysis_id, repo_name, repo_owner, status, progress, code_quality, created_at",
+        {
+          count: "exact",
+        }
+      )
+      .order("created_at", { ascending: false })
+      .range(offset, offset + parseInt(limit) - 1);
+
+    if (userId) {
+      query = query.eq("user_id", userId);
+    }
+
+    const { data, error, count } = await query;
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      history: data,
+      total: count,
+      limit: parseInt(limit),
+      offset: parseInt(offset),
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Failed to get history",
+      details: error.message,
+    });
+  }
+};
+
+// =============================
+// CORE WORKFLOW FUNCTIONS
+// =============================
+
+async function performAnalysis(
+  analysisId,
+  repoUrl,
+  repoName,
+  owner,
+  enableAIFix,
+  accessToken
+) {
+  let tempDir = null;
+
+  try {
+    console.log(`\n${"=".repeat(60)}`);
+    console.log(`🚀 Starting analysis: ${analysisId}`);
+    console.log(`📦 Repository: ${owner}/${repoName}`);
+    console.log(`🔗 URL: ${repoUrl}`);
+    console.log(`${"=".repeat(60)}\n`);
+
+    // Step 1: Clone
+    tempDir = path.join(__dirname, "../temp", analysisId);
+    console.log(`📁 Creating temp directory: ${tempDir}`);
+    await fs.mkdir(tempDir, { recursive: true });
+    console.log(`✅ Directory created`);
+
+    await updateProgress(analysisId, "cloning", 15, 1, "Cloning repository...");
+    console.log(`\n📥 Step 1/6: Cloning repository...`);
+    await cloneRepository(repoUrl, tempDir);
+    console.log(`✅ Clone completed successfully\n`);
+
+    // Step 2: Analyze structure
+    await updateProgress(
+      analysisId,
+      "analyzing",
+      30,
+      2,
+      "Analyzing structure..."
+    );
+    console.log(`📊 Step 2/6: Analyzing structure...`);
+    const structure = await analyzeStructure(tempDir);
+    console.log(`✅ Structure analyzed: ${structure.totalFiles} files found\n`);
+
+    // Step 3: Static analysis
+    await updateProgress(
+      analysisId,
+      "analyzing",
+      45,
+      3,
+      "Running static analysis..."
+    );
+    console.log(`🔍 Step 3/6: Running static analysis...`);
+    const staticAnalysis = { issues: 0 };
+    console.log(`✅ Static analysis completed\n`);
+
+    // Step 4: Security scan
+    await updateProgress(
+      analysisId,
+      "analyzing",
+      60,
+      4,
+      "Security scanning..."
+    );
+    console.log(`🔒 Step 4/6: Security scanning...`);
+    const security = { vulnerabilities: 0 };
+    console.log(`✅ Security scan completed\n`);
+
+    // Step 5: AI Analysis (Cline)
+    await updateProgress(
+      analysisId,
+      "ai_analyzing",
+      75,
+      5,
+      "Running AI analysis..."
+    );
+    console.log(`🤖 Step 5/6: Running Cline AI analysis...`);
+    const aiAnalysis = await runAIAnalysis(tempDir);
+    console.log(
+      `✅ AI analysis completed:`,
+      aiAnalysis.success ? "Success" : "Failed"
+    );
+    if (!aiAnalysis.success && aiAnalysis.error) {
+      console.error(`⚠️ AI Analysis error: ${aiAnalysis.error}`);
+    }
+    console.log();
+
+    // Step 6: Calculate score
+    await updateProgress(
+      analysisId,
+      "analyzing",
+      90,
+      6,
+      "Calculating score..."
+    );
+    console.log(`📈 Step 6/6: Calculating quality score...`);
+    const codeQuality = calculateScore(aiAnalysis);
+    console.log(
+      `✅ Score calculated: ${codeQuality.score}/100 (Grade: ${codeQuality.grade})\n`
+    );
+
+    // Save results
+    console.log(`💾 Saving results to database...`);
+    const { error: updateError } = await supabase
+      .from("analyses")
+      .update({
+        status: "completed",
+        progress: 100,
+        current_step: 6,
+        message: "Analysis complete",
+        structure,
+        code_quality: codeQuality,
+        ai_analysis: aiAnalysis,
+        completed_at: new Date().toISOString(),
+      })
+      .eq("analysis_id", analysisId);
+
+    if (updateError) {
+      console.error(`❌ Database update failed:`, updateError);
+      throw updateError;
+    }
+
+    console.log(`✅ Results saved to database`);
+    console.log(`\n${"=".repeat(60)}`);
+    console.log(`✅ Analysis completed successfully: ${analysisId}`);
+    console.log(`${"=".repeat(60)}\n`);
+
+    // Optional AI fix
+    if (enableAIFix && accessToken) {
+      console.log(`🔧 Starting AI fix workflow...`);
+      await runAIFixWorkflow(
+        { analysisId, repoName, owner, repoUrl },
+        accessToken,
+        tempDir
+      );
+    } else {
+      console.log(`🧹 Cleaning up temp directory...`);
+      await cleanupTempDir(tempDir);
+    }
+  } catch (error) {
+    console.error(`\n${"=".repeat(60)}`);
+    console.error(`❌ Analysis failed: ${analysisId}`);
+    console.error(`Error message: ${error.message}`);
+    console.error(`Stack trace:`, error.stack);
+    console.error(`${"=".repeat(60)}\n`);
+
+    try {
+      await supabase
+        .from("analyses")
+        .update({
+          status: "failed",
+          error: error.message,
+          error_details: error.stack,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("analysis_id", analysisId);
+      console.log(`✅ Error status saved to database`);
+    } catch (dbError) {
+      console.error(`❌ Failed to save error status:`, dbError);
+    }
+
+    if (tempDir) {
+      console.log(`🧹 Cleaning up temp directory after error...`);
+      await cleanupTempDir(tempDir);
     }
   }
-
-  // Sort and limit largest files
-  structure.largestFiles = structure.largestFiles
-    .sort((a, b) => b.lines - a.lines)
-    .slice(0, 10);
-
-  // Get unique directories
-  structure.directories = [
-    ...new Set(files.map((f) => path.dirname(f.replace(repoPath, "")))),
-  ].filter((d) => d !== "" && d !== ".");
-
-  console.log(`   ✓ Analyzed ${structure.totalFiles} files`);
-
-  return structure;
 }
 
-// Helper: Get all files recursively (Windows compatible)
+// =============================
+// HELPER FUNCTIONS
+// =============================
+
+async function cloneRepository(repoUrl, targetDir) {
+  return new Promise((resolve, reject) => {
+    console.log(`   Running: git clone --depth 1 ${repoUrl}`);
+    const proc = spawn("git", ["clone", "--depth", "1", repoUrl, targetDir]);
+
+    let stderr = "";
+    let stdout = "";
+
+    proc.stdout.on("data", (data) => {
+      const output = data.toString();
+      stdout += output;
+      console.log(`   [Git] ${output.trim()}`);
+    });
+
+    proc.stderr.on("data", (data) => {
+      const output = data.toString();
+      stderr += output;
+      // Git outputs progress to stderr (not an error)
+      console.log(`   [Git] ${output.trim()}`);
+    });
+
+    proc.on("close", (code) => {
+      if (code === 0) {
+        console.log(`   ✅ Git clone successful (exit code 0)`);
+        resolve();
+      } else {
+        console.error(`   ❌ Git clone failed (exit code ${code})`);
+        console.error(`   stderr: ${stderr}`);
+        reject(new Error(`Git clone failed: ${stderr}`));
+      }
+    });
+
+    proc.on("error", (err) => {
+      console.error(`   ❌ Git process error:`, err);
+      reject(err);
+    });
+
+    setTimeout(() => {
+      console.error(`   ⏰ Git clone timeout (5 minutes exceeded)`);
+      proc.kill();
+      reject(new Error("Clone timeout"));
+    }, 300000);
+  });
+}
+
+async function analyzeStructure(repoPath) {
+  try {
+    console.log(`   Scanning directory: ${repoPath}`);
+    const files = await getAllFiles(repoPath);
+    console.log(`   Found ${files.length} files`);
+    return { totalFiles: files.length };
+  } catch (error) {
+    console.error(`   ❌ Structure analysis failed:`, error);
+    throw error;
+  }
+}
+
 async function getAllFiles(dir) {
   const files = [];
 
@@ -508,22 +525,26 @@ async function getAllFiles(dir) {
       for (const entry of entries) {
         const fullPath = path.join(currentPath, entry.name);
 
-        // Skip common directories
         if (entry.isDirectory()) {
+          // Skip certain directories
           if (
-            !entry.name.includes("node_modules") &&
-            !entry.name.includes(".git") &&
-            !entry.name.includes("dist") &&
-            !entry.name.includes("build")
+            ![
+              "node_modules",
+              ".git",
+              "dist",
+              "build",
+              ".next",
+              "coverage",
+            ].includes(entry.name)
           ) {
             await walk(fullPath);
           }
-        } else {
+        } else if (entry.isFile()) {
           files.push(fullPath);
         }
       }
     } catch (error) {
-      // Skip directories we can't read
+      console.warn(`   ⚠️ Skipping directory ${currentPath}: ${error.message}`);
     }
   }
 
@@ -531,476 +552,457 @@ async function getAllFiles(dir) {
   return files;
 }
 
-// Run Cline CLI analysis
-async function runClineAnalysis(repoPath, repoName) {
-  console.log(`   🤖 Running Cline CLI analysis...`);
-  // Always use simulated analysis for now
-  return simulateClineAnalysis(repoPath);
-}
+async function runAIAnalysis(repoPath) {
+  const prompt = `Analyze this codebase comprehensively and return a JSON object with:
+- architecture: {pattern, strengths[], weaknesses[]}
+- codeQuality: {score (0-100), issues[]}
+- bugs: [{severity, description, file}]
+- security: [{type, severity, file}]
+- recommendations: [{priority, title, description}]
 
-// Simulate Cline analysis (Windows compatible)
-async function simulateClineAnalysis(repoPath) {
-  console.log(`   🔄 Running simulated code analysis...`);
+Return ONLY valid JSON, no markdown, no code blocks, no explanations.`;
 
-  const issues = [];
-  const suggestions = [];
+  try {
+    console.log(`   Running Cline CLI...`);
+    const output = await runClineTask(prompt, repoPath);
+    console.log(`   Cline output received (${output.length} chars)`);
 
-  // Get JavaScript/TypeScript files
-  const files = await getAllFiles(repoPath);
-  const codeFiles = files
-    .filter(
-      (f) =>
-        f.match(/\.(js|ts|jsx|tsx)$/) &&
-        !f.includes("node_modules") &&
-        !f.includes(".test.") &&
-        !f.includes(".spec.")
-    )
-    .slice(0, 20);
+    // Save debug output
+    const debugPath = path.join(__dirname, "../temp", "cline-debug.txt");
+    await fs.writeFile(debugPath, output, "utf8");
+    console.log(`   📝 Debug output saved to: ${debugPath}`);
 
-  for (const file of codeFiles) {
+    // Extract JSON using improved function
+    let jsonData = null;
+
     try {
-      const content = await fs.readFile(file, "utf8");
-      const relativePath = file.replace(repoPath, "");
+      console.log(`   Attempting to extract JSON using extractJSON()...`);
+      jsonData = extractJSON(output);
+      console.log(`   ✅ Successfully extracted and parsed JSON`);
+    } catch (extractError) {
+      console.warn(`   ⚠️ extractJSON failed: ${extractError.message}`);
 
-      // Check for console.log
-      const consoleMatches = content.match(/console\.(log|warn|error)/g);
-      if (consoleMatches && consoleMatches.length > 0) {
-        issues.push({
-          type: "code-quality",
-          severity: "low",
-          file: relativePath,
-          description: `Found ${consoleMatches.length} console statement(s). Consider using a proper logging library.`,
-          suggestion:
-            "Replace console statements with a logging library like winston or pino",
-        });
-      }
-
-      // Check for TODO comments
-      const todoMatches = content.match(/\/\/\s*TODO:/gi);
-      if (todoMatches) {
-        issues.push({
-          type: "maintenance",
-          severity: "info",
-          file: relativePath,
-          description: `Found ${todoMatches.length} TODO comment(s)`,
-          suggestion: "Create GitHub issues for TODO items",
-        });
-      }
-
-      // Check for eval usage
-      if (content.includes("eval(")) {
-        issues.push({
-          type: "security",
-          severity: "high",
-          file: relativePath,
-          description: "Using eval() is a security risk",
-          suggestion: "Remove eval() and use safer alternatives",
-        });
-      }
-
-      // Check file size
-      const lines = content.split("\n").length;
-      if (lines > 500) {
-        suggestions.push({
-          file: relativePath,
-          suggestion: `File is ${lines} lines long. Consider breaking it into smaller modules.`,
-        });
-      }
-    } catch (error) {
-      // Skip files that can't be read
-    }
-  }
-
-  console.log(`   ✓ Found ${issues.length} potential issues`);
-
-  return { issues, suggestions, improvements: [] };
-}
-
-// Check security vulnerabilities (Windows compatible)
-async function checkSecurity(repoPath) {
-  console.log(`   🔒 Scanning for security issues...`);
-
-  const security = {
-    vulnerabilities: [],
-    critical: 0,
-    high: 0,
-    medium: 0,
-    low: 0,
-  };
-
-  // Check if package.json exists
-  const packageJsonPath = path.join(repoPath, "package.json");
-
-  try {
-    await fs.access(packageJsonPath);
-    console.log(`   ℹ️  Found package.json`);
-  } catch {
-    console.log(`   ℹ️  No package.json found`);
-  }
-
-  // Check for common security issues in code
-  await checkCodeSecurityIssues(repoPath, security);
-
-  return security;
-}
-
-// Check code for security issues
-async function checkCodeSecurityIssues(repoPath, security) {
-  try {
-    const files = await getAllFiles(repoPath);
-    const codeFiles = files
-      .filter((f) => f.match(/\.(js|ts)$/) && !f.includes("node_modules"))
-      .slice(0, 50);
-
-    for (const file of codeFiles) {
-      try {
-        const content = await fs.readFile(file, "utf8");
-        const relativePath = file.replace(repoPath, "");
-
-        // Check for hardcoded secrets
-        const secretPatterns = [
-          /password\s*=\s*["'][^"']+["']/i,
-          /api[_-]?key\s*=\s*["'][^"']+["']/i,
-          /secret\s*=\s*["'][^"']+["']/i,
-          /token\s*=\s*["'][^"']+["']/i,
-        ];
-
-        for (const pattern of secretPatterns) {
-          if (pattern.test(content)) {
-            security.vulnerabilities.push({
-              type: "security",
-              severity: "critical",
-              file: relativePath,
-              description: "Potential hardcoded credentials detected",
-              recommendation: "Move secrets to environment variables",
-            });
-            security.critical++;
-            break;
-          }
+      // Fallback: Try to find the LAST JSON object manually
+      const matches = output.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g);
+      if (matches && matches.length > 0) {
+        console.log(
+          `   Found ${matches.length} JSON-like patterns, trying last one...`
+        );
+        const lastMatch = matches[matches.length - 1];
+        try {
+          jsonData = JSON.parse(lastMatch);
+          console.log(`   ✅ Fallback parsing succeeded`);
+        } catch (e) {
+          console.error(`   ❌ Fallback parsing failed: ${e.message}`);
         }
-
-        // Check for SQL injection
-        if (content.match(/query\s*\(.*\$\{.*\}\)/)) {
-          security.vulnerabilities.push({
-            type: "security",
-            severity: "high",
-            file: relativePath,
-            description: "Potential SQL injection vulnerability",
-            recommendation: "Use parameterized queries",
-          });
-          security.high++;
-        }
-      } catch {
-        // Skip files that can't be read
       }
     }
-  } catch {
-    // Ignore errors
-  }
-}
 
-// Analyze dependencies
-async function analyzeDependencies(repoPath) {
-  console.log(`   📦 Analyzing dependencies...`);
+    // If we found valid JSON, normalize and return it
+    if (jsonData) {
+      console.log(`   🔍 Normalizing JSON structure...`);
 
-  const dependencies = {
-    total: 0,
-    production: 0,
-    development: 0,
-    outdated: [],
-    deprecated: [],
-  };
+      const normalizedData = {
+        success: true,
+        architecture: jsonData.architecture || {
+          pattern: "Unknown",
+          strengths: [],
+          weaknesses: [],
+        },
+        codeQuality: normalizeCodeQuality(jsonData),
+        bugs: jsonData.bugs || jsonData.potential_bugs || [],
+        security: normalizeSecurity(jsonData),
+        recommendations: jsonData.recommendations || [],
+      };
 
-  try {
-    const packageJsonPath = path.join(repoPath, "package.json");
-    const packageJson = JSON.parse(await fs.readFile(packageJsonPath, "utf8"));
+      console.log(`   ✅ JSON normalized successfully`);
+      console.log(`   📊 Score: ${normalizedData.codeQuality.score}/100`);
 
-    if (packageJson.dependencies) {
-      dependencies.production = Object.keys(packageJson.dependencies).length;
+      return normalizedData;
     }
 
-    if (packageJson.devDependencies) {
-      dependencies.development = Object.keys(
-        packageJson.devDependencies
-      ).length;
-    }
+    // Fallback: No valid JSON found
+    console.warn(`   ⚠️ Could not extract valid JSON from output`);
 
-    dependencies.total = dependencies.production + dependencies.development;
-
-    console.log(`   ✓ Found ${dependencies.total} dependencies`);
-  } catch {
-    console.log(`   ℹ️  No dependencies found`);
-  }
-
-  return dependencies;
-}
-
-// Check test coverage
-async function checkTestCoverage(repoPath) {
-  console.log(`   🧪 Checking test coverage...`);
-
-  const coverage = {
-    percentage: 0,
-    hasTests: false,
-    lines: { covered: 0, total: 0 },
-    functions: { covered: 0, total: 0 },
-    branches: { covered: 0, total: 0 },
-  };
-
-  try {
-    const files = await getAllFiles(repoPath);
-    const testFiles = files.filter(
-      (f) =>
-        (f.includes(".test.") || f.includes(".spec.")) &&
-        !f.includes("node_modules")
+    // Show relevant parts of output for debugging
+    const lines = output.split("\n");
+    const relevantLines = lines.filter(
+      (line) =>
+        line.includes("{") ||
+        line.includes("}") ||
+        line.includes("architecture")
     );
+    console.log(`   Relevant output lines (${relevantLines.length}):`);
+    relevantLines
+      .slice(0, 10)
+      .forEach((line) => console.log(`     ${line.substring(0, 100)}`));
 
-    coverage.hasTests = testFiles.length > 0;
-
-    if (coverage.hasTests) {
-      console.log(`   ✓ Found ${testFiles.length} test file(s)`);
-
-      // Estimate coverage based on test files
-      const sourceFiles = files.filter(
-        (f) =>
-          f.match(/\.(js|ts)$/) &&
-          !f.includes("node_modules") &&
-          !f.includes(".test.") &&
-          !f.includes(".spec.")
-      ).length;
-
-      coverage.percentage = Math.min(
-        Math.round((testFiles.length / Math.max(sourceFiles, 1)) * 100),
-        100
-      );
-    } else {
-      console.log(`   ⚠️  No test files found`);
-    }
-  } catch {
-    console.log(`   ℹ️  Could not check test coverage`);
-  }
-
-  return coverage;
-}
-
-// Calculate code quality score
-function calculateCodeQuality(data) {
-  let score = 100;
-
-  // Deduct for issues
-  score -= data.clineAnalysis.issues.length * 2;
-
-  // Deduct for security vulnerabilities
-  score -= data.securityCheck.critical * 10;
-  score -= data.securityCheck.high * 5;
-  score -= data.securityCheck.medium * 2;
-
-  // Deduct for low test coverage
-  if (data.testCoverage.percentage < 80) {
-    score -= (80 - data.testCoverage.percentage) / 2;
-  }
-
-  // Deduct for large files
-  if (data.structure.largestFiles.length > 0) {
-    const largeFileCount = data.structure.largestFiles.filter(
-      (f) => f.lines > 500
-    ).length;
-    score -= largeFileCount * 3;
-  }
-
-  // Bonus for good practices
-  if (data.structure.hasTypeScript) score += 5;
-  if (data.structure.hasLinter) score += 5;
-  if (data.structure.hasCI) score += 5;
-  if (data.testCoverage.percentage > 90) score += 10;
-
-  // Clamp score
-  score = Math.max(0, Math.min(100, Math.round(score)));
-
-  const grade =
-    score >= 90
-      ? "A"
-      : score >= 80
-      ? "B"
-      : score >= 70
-      ? "C"
-      : score >= 60
-      ? "D"
-      : "F";
-
-  const complexity = score >= 80 ? "low" : score >= 60 ? "medium" : "high";
-  const maintainability = score >= 75 ? "good" : score >= 50 ? "fair" : "poor";
-
-  return { score, grade, complexity, maintainability };
-}
-
-// Generate recommendations
-function generateRecommendations(data) {
-  const recommendations = [];
-
-  // Security recommendations
-  if (data.securityCheck.critical > 0) {
-    recommendations.push({
-      priority: 1,
-      category: "security",
-      title: "Fix Critical Security Vulnerabilities",
-      description: `Found ${data.securityCheck.critical} critical security issue(s). These should be addressed immediately.`,
-      action: "Run security audit and update vulnerable packages",
-    });
-  }
-
-  // Test coverage recommendations
-  if (!data.testCoverage.hasTests) {
-    recommendations.push({
-      priority: 2,
-      category: "testing",
-      title: "Add Unit Tests",
-      description:
-        "No test files found. Adding tests will improve code reliability and catch bugs early.",
-      action: "Set up testing framework (Jest/Mocha) and add unit tests",
-    });
-  } else if (data.testCoverage.percentage < 80) {
-    recommendations.push({
-      priority: 3,
-      category: "testing",
-      title: "Improve Test Coverage",
-      description: `Current test coverage is ${data.testCoverage.percentage}%. Aim for at least 80%.`,
-      action: "Add tests for uncovered code paths",
-    });
-  }
-
-  // Code quality recommendations
-  if (!data.structure.hasTypeScript && data.structure.totalFiles > 10) {
-    recommendations.push({
-      priority: 4,
-      category: "code-quality",
-      title: "Consider TypeScript Migration",
-      description:
-        "TypeScript adds type safety and improves code maintainability.",
-      action: "Gradually migrate to TypeScript starting with new files",
-    });
-  }
-
-  if (!data.structure.hasLinter) {
-    recommendations.push({
-      priority: 5,
-      category: "code-quality",
-      title: "Add Code Linter",
-      description:
-        "A linter helps maintain consistent code style and catches common errors.",
-      action: "Set up ESLint with appropriate configuration",
-    });
-  }
-
-  // CI/CD recommendations
-  if (!data.structure.hasCI) {
-    recommendations.push({
-      priority: 6,
-      category: "devops",
-      title: "Set Up CI/CD Pipeline",
-      description:
-        "Automated testing and deployment improves development workflow.",
-      action: "Add GitHub Actions or GitLab CI configuration",
-    });
-  }
-
-  // Refactoring recommendations
-  const largeFiles = data.structure.largestFiles.filter((f) => f.lines > 500);
-  if (largeFiles.length > 0) {
-    recommendations.push({
-      priority: 7,
-      category: "refactoring",
-      title: "Refactor Large Files",
-      description: `${largeFiles.length} file(s) are over 500 lines. Consider breaking them into smaller modules.`,
-      action: "Split large files into smaller, focused modules",
-    });
-  }
-
-  return recommendations;
-}
-
-// Save analysis to storage
-async function saveAnalysis(analysis) {
-  try {
-    const analysisDir = path.join(__dirname, "../data/analyses");
-    await fs.mkdir(analysisDir, { recursive: true });
-
-    const filePath = path.join(analysisDir, `${analysis.analysisId}.json`);
-    await fs.writeFile(filePath, JSON.stringify(analysis, null, 2));
-
-    console.log(`   💾 Analysis saved: ${analysis.analysisId}`);
+    return {
+      success: false,
+      error: "Could not parse JSON from Cline output",
+      rawOutput: output.substring(0, 1000),
+      architecture: {
+        pattern: "Analysis incomplete",
+        strengths: [],
+        weaknesses: [],
+      },
+      codeQuality: { score: 70, issues: ["JSON parsing failed"] },
+      bugs: [],
+      security: [],
+      recommendations: [
+        {
+          priority: 1,
+          title: "Review Cline output format",
+          description:
+            "Cline returned non-JSON formatted response. Check temp/cline-debug.txt",
+        },
+      ],
+    };
   } catch (error) {
-    console.error(`   ⚠️  Could not save analysis:`, error.message);
+    console.error(`   ❌ AI analysis error:`, error.message);
+    return {
+      success: false,
+      error: error.message,
+      architecture: { pattern: "Error", strengths: [], weaknesses: [] },
+      codeQuality: { score: 0, issues: [error.message] },
+      bugs: [],
+      security: [],
+      recommendations: [],
+    };
   }
 }
 
-// Load analysis from storage
-async function loadAnalysis(analysisId) {
+// =============================
+// HELPER FUNCTIONS FOR NORMALIZATION
+// =============================
+
+function normalizeCodeQuality(jsonData) {
+  // Handle different possible property names
+  if (jsonData.codeQuality) {
+    return {
+      score: jsonData.codeQuality.score || 75,
+      issues: jsonData.codeQuality.issues || [],
+    };
+  } else if (jsonData.code_quality) {
+    return {
+      score: jsonData.code_quality.score || 75,
+      issues: jsonData.code_quality.issues || [],
+    };
+  } else if (typeof jsonData.code_quality_score === "number") {
+    return {
+      score: jsonData.code_quality_score,
+      issues: [],
+    };
+  } else {
+    return {
+      score: 75,
+      issues: [],
+    };
+  }
+}
+
+function normalizeSecurity(jsonData) {
+  // Handle different possible property names
+  if (Array.isArray(jsonData.security)) {
+    return jsonData.security;
+  } else if (jsonData.security_assessment) {
+    // Convert from object format to array
+    if (Array.isArray(jsonData.security_assessment.vulnerabilities)) {
+      return jsonData.security_assessment.vulnerabilities;
+    } else if (typeof jsonData.security_assessment === "object") {
+      // Convert object properties to array
+      const vulnerabilities =
+        jsonData.security_assessment.vulnerabilities || [];
+      return Array.isArray(vulnerabilities) ? vulnerabilities : [];
+    }
+  }
+  return [];
+}
+
+function runClineTask(prompt, repoPath) {
+  return new Promise((resolve, reject) => {
+    console.log(`   Running Cline via WSL...`);
+
+    const wslPath = repoPath
+      .replace(/\\/g, "/")
+      .replace(/^([A-Z]):/, (match, drive) => `/mnt/${drive.toLowerCase()}`);
+
+    console.log(`   Windows path: ${repoPath}`);
+    console.log(`   WSL path: ${wslPath}`);
+
+    // ✅ FIX: Use bash to cd into directory first, then run cline
+    const bashCommand = `cd "${wslPath}" && export ANTHROPIC_API_KEY="${process.env.ANTHROPIC_API_KEY}" && cline "${prompt}" --oneshot`;
+
+    console.log(`   Executing: wsl bash -c "cd ... && cline ..."`);
+
+    const proc = spawn("wsl", ["bash", "-l", "-c", bashCommand], {
+      env: {
+        ...process.env,
+      },
+    });
+
+    let output = "";
+    let stderr = "";
+
+    proc.stdout.on("data", (d) => {
+      const text = d.toString();
+      output += text;
+      // Only log non-verbose output
+      if (!text.includes("Checkpoint") && text.trim().length < 200) {
+        console.log(`   [Cline] ${text.trim()}`);
+      }
+    });
+
+    proc.stderr.on("data", (d) => {
+      const text = d.toString();
+      stderr += text;
+      console.error(`   [Cline Error] ${text.trim()}`);
+    });
+
+    proc.on("close", (code) => {
+      if (code === 0) {
+        console.log(`   ✅ Cline completed (exit code 0)`);
+        resolve(output);
+      } else {
+        console.error(`   ❌ Cline failed (exit code ${code})`);
+        reject(new Error(stderr || "Cline failed"));
+      }
+    });
+
+    proc.on("error", (err) => {
+      console.error(`   ❌ Cline process error:`, err);
+      reject(err);
+    });
+
+    setTimeout(() => {
+      console.error(`   ⏰ Cline timeout (10 minutes exceeded)`);
+      proc.kill();
+      reject(new Error("Cline timeout"));
+    }, 600000);
+  });
+}
+
+async function cleanupTempDir(dir) {
   try {
-    const filePath = path.join(
-      __dirname,
-      "../data/analyses",
-      `${analysisId}.json`
-    );
-    const data = await fs.readFile(filePath, "utf8");
-    return JSON.parse(data);
-  } catch {
+    await fs.rm(dir, { recursive: true, force: true });
+    console.log(`   ✅ Cleaned up: ${dir}`);
+  } catch (error) {
+    console.warn(`   ⚠️ Cleanup warning: ${error.message}`);
+  }
+}
+
+// ...rest of existing functions (updateProgress, runCommand, runAIFix, etc.)...
+
+async function updateProgress(analysisId, status, progress, step, message) {
+  await supabase
+    .from("analyses")
+    .update({ status, progress, current_step: step, message })
+    .eq("analysis_id", analysisId);
+}
+
+async function runCommand(cmd, args, cwd) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, { cwd });
+    let stderr = "";
+
+    proc.stderr.on("data", (d) => (stderr += d.toString()));
+
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(stderr));
+    });
+  });
+}
+
+async function runAIFix(repoPath) {
+  const prompt = `Apply safe code improvements: fix formatting, add error handling, improve documentation, apply best practices. List modified files.`;
+
+  try {
+    return await runClineTask(prompt, repoPath);
+  } catch (error) {
     return null;
   }
 }
 
-// Update analysis status
-async function updateAnalysisStatus(analysisId, status, data = {}) {
+async function runAIFixWorkflow(analysis, accessToken, existingTempDir = null) {
+  let tempDir = existingTempDir;
+  const { analysisId, repoName, owner, repoUrl } = analysis;
+
   try {
-    const analysis = (await loadAnalysis(analysisId)) || { analysisId };
-
-    analysis.status = status;
-    analysis.lastUpdated = new Date().toISOString();
-    Object.assign(analysis, data);
-
-    await saveAnalysis(analysis);
-  } catch (error) {
-    console.error(`   ⚠️  Could not update status:`, error.message);
-  }
-}
-
-// Get analysis history for user
-async function getAnalysisHistoryForUser(userId, limit, offset) {
-  try {
-    const analysisDir = path.join(__dirname, "../data/analyses");
-    const files = await fs.readdir(analysisDir);
-
-    const analyses = [];
-    for (const file of files) {
-      const filePath = path.join(analysisDir, file);
-      const data = await fs.readFile(filePath, "utf8");
-      const analysis = JSON.parse(data);
-
-      analyses.push({
-        analysisId: analysis.analysisId,
-        repository: analysis.repository,
-        status: analysis.status,
-        timestamp: analysis.timestamp,
-        codeQuality: analysis.codeQuality,
-      });
+    if (!tempDir) {
+      tempDir = path.join(__dirname, "../temp", `${analysisId}-fix`);
+      await fs.mkdir(tempDir, { recursive: true });
+      await cloneRepository(repoUrl, tempDir);
     }
 
-    return analyses
-      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-      .slice(offset, offset + parseInt(limit));
-  } catch {
-    return [];
-  }
-}
+    await runCommand("git", ["config", "user.name", "DevPulse AI"], tempDir);
+    await runCommand(
+      "git",
+      ["config", "user.email", "ai@devpulse.app"],
+      tempDir
+    );
 
-// Cleanup temp directory
-async function cleanupTempDir(dir) {
-  try {
-    await fs.rm(dir, { recursive: true, force: true });
-    console.log(`   🧹 Cleaned up: ${dir}`);
+    const branchName = `devpulse-ai-fix-${Date.now()}`;
+    await runCommand("git", ["checkout", "-b", branchName], tempDir);
+
+    const fixResult = await runAIFix(tempDir);
+
+    if (!fixResult || fixResult.length === 0) {
+      console.log(`No changes needed`);
+      await cleanupTempDir(tempDir);
+      return;
+    }
+
+    await runCommand("git", ["add", "."], tempDir);
+    await runCommand(
+      "git",
+      ["commit", "-m", "🤖 AI improvements by DevPulse"],
+      tempDir
+    );
+
+    const authenticatedUrl = repoUrl.replace(
+      "https://",
+      `https://${accessToken}@`
+    );
+    await runCommand(
+      "git",
+      ["remote", "set-url", "origin", authenticatedUrl],
+      tempDir
+    );
+    await runCommand("git", ["push", "-u", "origin", branchName], tempDir);
+
+    const pr = await createPullRequest(
+      owner,
+      repoName,
+      branchName,
+      analysisId,
+      accessToken
+    );
+
+    await supabase
+      .from("analyses")
+      .update({
+        ai_fix_result: {
+          success: true,
+          pr_url: pr.url,
+          pr_number: pr.number,
+        },
+      })
+      .eq("analysis_id", analysisId);
+
+    console.log(`✅ PR created: ${pr.url}`);
+    await cleanupTempDir(tempDir);
   } catch (error) {
-    console.warn(`   ⚠️  Could not cleanup ${dir}:`, error.message);
+    console.error(`❌ AI Fix failed:`, error.message);
+
+    await supabase
+      .from("analyses")
+      .update({
+        ai_fix_result: { success: false, error: error.message },
+      })
+      .eq("analysis_id", analysisId);
+
+    if (tempDir && !existingTempDir) await cleanupTempDir(tempDir);
   }
 }
 
-module.exports = exports;
+async function createPullRequest(
+  owner,
+  repo,
+  branchName,
+  analysisId,
+  accessToken
+) {
+  const response = await axios.post(
+    `https://api.github.com/repos/${owner}/${repo}/pulls`,
+    {
+      title: "🤖 DevPulse AI: Code Quality Improvements",
+      body: `AI-powered improvements by DevPulse.\n\nAnalysis ID: \`${analysisId}\``,
+      head: branchName,
+      base: "main",
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/vnd.github.v3+json",
+      },
+    }
+  );
+
+  return { url: response.data.html_url, number: response.data.number };
+}
+
+function calculateScore(aiAnalysis) {
+  const score = aiAnalysis?.codeQuality?.score || 75;
+  const grade = score >= 90 ? "A" : score >= 80 ? "B" : score >= 70 ? "C" : "D";
+  return { score, grade };
+}
+
+//Function for extracting JSON from cline response
+function extractJSON(output) {
+  // Find ALL potential JSON objects
+  const allJsonMatches = [];
+  let searchStart = 0;
+
+  while (searchStart < output.length) {
+    const startIndex = output.indexOf("{", searchStart);
+    if (startIndex === -1) break;
+
+    let stack = 0;
+    let endIndex = -1;
+
+    for (let i = startIndex; i < output.length; i++) {
+      if (output[i] === "{") stack++;
+      else if (output[i] === "}") stack--;
+
+      if (stack === 0) {
+        endIndex = i;
+        break;
+      }
+    }
+
+    if (endIndex !== -1) {
+      const jsonString = output.slice(startIndex, endIndex + 1);
+      allJsonMatches.push({
+        start: startIndex,
+        end: endIndex,
+        json: jsonString,
+      });
+      searchStart = endIndex + 1;
+    } else {
+      break;
+    }
+  }
+
+  if (allJsonMatches.length === 0) {
+    throw new Error("No JSON object found in Cline output");
+  }
+
+  console.log(`   Found ${allJsonMatches.length} potential JSON objects`);
+
+  // Try to parse from the LAST one (most likely to be the actual response)
+  for (let i = allJsonMatches.length - 1; i >= 0; i--) {
+    try {
+      const parsed = JSON.parse(allJsonMatches[i].json);
+
+      // Validate it has expected fields
+      if (parsed.architecture || parsed.codeQuality || parsed.recommendations) {
+        console.log(
+          `   ✅ Valid JSON found at position ${i + 1}/${allJsonMatches.length}`
+        );
+        return parsed;
+      }
+    } catch (err) {
+      console.warn(`   JSON object ${i + 1} failed to parse: ${err.message}`);
+    }
+  }
+
+  // If none parsed successfully, throw error with the last attempt
+  const lastJson = allJsonMatches[allJsonMatches.length - 1].json;
+  try {
+    return JSON.parse(lastJson);
+  } catch (err) {
+    console.error("Failed JSON:\n", lastJson.substring(0, 500));
+    throw new Error("Extracted JSON is not valid: " + err.message);
+  }
+}

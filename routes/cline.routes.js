@@ -6,19 +6,28 @@ const { verifyToken } = require("../middlewares/auth.middleware");
 // Protected routes - require authentication
 router.use(verifyToken);
 
-// Analyze repository (when user selects from dashboard)
+// Start analysis
 router.post("/analyze", clineController.analyzeRepository);
 
-// Get analysis results
+// Get full analysis results
 router.get("/analysis/:analysisId", clineController.getAnalysis);
 
-// Stream analysis progress (SSE)
+// Get progress (polling - simple JSON response)
 router.get(
   "/analysis/:analysisId/progress",
+  clineController.getAnalysisProgress
+);
+
+// Stream progress in real-time (SSE - Server-Sent Events)
+router.get(
+  "/analysis/:analysisId/stream",
   clineController.streamAnalysisProgress
 );
 
 // Get analysis history
 router.get("/history", clineController.getAnalysisHistory);
+
+//AI fix
+router.post("/ai-fix", verifyToken, clineController.triggerAIFix);
 
 module.exports = router;
