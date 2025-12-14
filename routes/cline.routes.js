@@ -3,31 +3,25 @@ const router = express.Router();
 const clineController = require("../controllers/cline.controllers");
 const { verifyToken } = require("../middlewares/auth.middleware");
 
-// Protected routes - require authentication
 router.use(verifyToken);
 
-// Start analysis
+// Analysis endpoints
+router.get("/all-analysis", clineController.getAllAnalyses);
 router.post("/analyze", clineController.analyzeRepository);
-
-// Get full analysis results
 router.get("/analysis/:analysisId", clineController.getAnalysis);
-
-// Get progress (polling - simple JSON response)
 router.get(
   "/analysis/:analysisId/progress",
   clineController.getAnalysisProgress
 );
-
-// Stream progress in real-time (SSE - Server-Sent Events)
 router.get(
   "/analysis/:analysisId/stream",
   clineController.streamAnalysisProgress
 );
-
-// Get analysis history
 router.get("/history", clineController.getAnalysisHistory);
 
-//AI fix
-router.post("/ai-fix", verifyToken, clineController.triggerAIFix);
+// AI fix endpoints
+router.post("/ai-fix", clineController.triggerAIFix);
+router.post("/autonomous-fix", clineController.autonomousHighImpactFix);
+router.get("/autonomous-fix/:jobId", clineController.getAutonomousFixStatus);
 
 module.exports = router;
