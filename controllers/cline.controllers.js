@@ -652,7 +652,12 @@ async function performAnalysis(
   try {
     console.log(`\n🚀 Analysis: ${analysisId}`);
 
-    tempDir = path.join(__dirname, "../temp", analysisId);
+    const isProduction =
+      process.env.VERCEL === "1" || process.env.NODE_ENV === "production";
+
+    tempDir = isProduction
+      ? "/tmp"
+      : path.join(__dirname, "../temp", analysisId);
     await fs.mkdir(tempDir, { recursive: true });
 
     await updateProgress(analysisId, "cloning", 15, 1, "Cloning repository...");
