@@ -169,6 +169,7 @@ exports.analyzeRepository = async (req, res) => {
 
     await supabase.from("analyses").insert({
       analysis_id: analysisId,
+      user_id: userId,
       repo_url: repoUrl,
       repo_name: repoName,
       repo_owner: owner,
