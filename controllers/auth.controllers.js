@@ -3,7 +3,8 @@ const jwt = require("jsonwebtoken");
 
 const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID;
 const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET;
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+// const FRONTEND_URL = process.env.FRONTEND_URL ||
+const FRONTEND_URL = "http://localhost:5173";
 const JWT_SECRET = process.env.JWT_SECRET;
 
 const GITHUB_URL = "https://github.com";
